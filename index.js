@@ -36,7 +36,7 @@ let ws = null;
 let pingTimer = null;
 
 // ─── DB ──────────────────────────────────────────────────────────────────────
-const db = new DatabaseSync("polymarket_paper.db");
+const db = new DatabaseSync(process.env.DB_PATH || "polymarket_paper.db");
 db.exec(`
   CREATE TABLE IF NOT EXISTS seen_trades (
     id TEXT PRIMARY KEY,
