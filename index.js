@@ -107,19 +107,25 @@ async function cmdStats() {
       SUM(CASE WHEN resolved=1 THEN 1 ELSE 0 END) as closed,
       SUM(CASE WHEN resolved=1 THEN pnl ELSE 0 END) as total_pnl,
       SUM(CASE WHEN resolved=1 AND pnl>0 THEN 1 ELSE 0 END) as wins,
-      SUM(CASE WHEN resolved=1 AND pnl<=0 THEN 1 ELSE 0 END) as losses
+      SUM(CASE WHEN resolved=1 AND pnl<=0 THEN 1 ELSE 0 END) as losses,
+      SUM(CASE WHEN resolved=0 THEN size_usd ELSE 0 END) as locked
     FROM paper_positions
   `).get();
+  const startingBalance = parseFloat(process.env.PAPER_BANKROLL || "1000");
   const pnl = s.total_pnl || 0;
   const open = s.open || 0;
   const closed = s.closed || 0;
   const wins = s.wins || 0;
   const losses = s.losses || 0;
+  const locked = s.locked || 0;
+  const balance = startingBalance + pnl - locked;
   const winRate = closed > 0 ? ((wins / closed) * 100).toFixed(1) + "%" : "N/A";
   await sendAlert(
     `📈 <b>PAPER STATS</b>\n━━━━━━━━━━━━━━━━━━━\n` +
+    `💰 Balance: <b>$${balance.toFixed(2)}</b> (started $${startingBalance.toFixed(0)})\n` +
+    `🔒 In open positions: <b>$${locked.toFixed(2)}</b>\n\n` +
     `📂 Total: ${s.total} | Open: ${open} | Closed: ${closed}\n` +
-    `${pnl >= 0 ? "🟢" : "🔴"} PnL: <b>${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</b>\n` +
+    `${pnl >= 0 ? "🟢" : "🔴"} Realised PnL: <b>${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</b>\n` +
     `🎯 Win rate: ${winRate} (W: ${wins} / L: ${losses})`
   );
 }
