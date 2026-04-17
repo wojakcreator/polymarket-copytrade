@@ -240,10 +240,15 @@ async function processActivityTrade(trade, wallet) {
   const marketId = trade.conditionId;
   if (!marketId) return;
 
-  // Skip markets resolving in less than 24 hours
+  // Skip if market already ended (endDate from trade or cache)
   const marketInfo = marketCache.get(marketId);
-  if (marketInfo?.endDate) {
-    const hoursLeft = (new Date(marketInfo.endDate) - Date.now()) / 3600000;
+  const endDate = trade.endDate || marketInfo?.endDate;
+  if (endDate) {
+    const hoursLeft = (new Date(endDate) - Date.now()) / 3600000;
+    if (hoursLeft < 0) {
+      console.log(`[SKIP] ${wallet.nickname} — market already ended (${trade.title?.substring(0, 40)})`);
+      return;
+    }
     if (hoursLeft < 24) {
       console.log(`[SKIP] ${wallet.nickname} — market resolves in ${hoursLeft.toFixed(1)}h`);
       return;
