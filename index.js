@@ -309,11 +309,16 @@ function connectWebSocket() {
     let events;
     try { events = JSON.parse(text); } catch { return; }
     const list = Array.isArray(events) ? events : [events];
+    let traded = false;
     for (const event of list) {
-      if (event.event_type !== "last_trade_price") continue;
-      // WS tells us someone traded — immediately check all whale wallets
-      await Promise.all(WALLETS.map(w => checkWalletTrades(w)));
-      break; // one trigger per message batch is enough
+      if (event.event_type === "last_trade_price" && !traded) {
+        traded = true;
+        await Promise.all(WALLETS.map(w => checkWalletTrades(w)));
+      }
+      if (event.event_type === "market_resolved") {
+        const marketId = event.market || event.condition_id;
+        if (marketId) await resolveMarket(marketId);
+      }
     }
   });
 
@@ -362,6 +367,38 @@ function resolveOutcomeFromMarket(market) {
   return null; // can't determine outcome yet
 }
 
+async function resolveMarket(marketId) {
+  const positions = db.prepare("SELECT * FROM paper_positions WHERE market_id = ? AND resolved = 0").all(marketId);
+  if (positions.length === 0) return;
+  try {
+    const resp = await axios.get(`${GAMMA_BASE}/markets`, {
+      params: { conditionId: marketId }, timeout: 8000
+    });
+    const market = resp.data?.[0];
+    if (!market) return;
+    const resPrice = resolveOutcomeFromMarket(market);
+    if (resPrice === null) return;
+    const outcomeLabel = resPrice === 1.0 ? "YES" : "NO";
+    let totalPnl = 0;
+    for (const pos of positions) {
+      const pnl = pos.side === "BUY"
+        ? (resPrice - pos.price) * pos.shares
+        : (pos.price - resPrice) * pos.shares;
+      totalPnl += pnl;
+      db.prepare("UPDATE paper_positions SET resolved=1, resolved_price=?, pnl=? WHERE id=?").run(resPrice, pnl, pos.id);
+    }
+    console.log(`[RESOLVED] ${market.question?.substring(0, 50)} → ${outcomeLabel} | PnL: $${totalPnl.toFixed(2)}`);
+    await sendAlert(
+      `🏁 <b>MARKET RESOLVED</b>\n━━━━━━━━━━━━━━━━━━━\n` +
+      `📊 ${market.question}\n📌 Outcome: <b>${outcomeLabel}</b>\n` +
+      `${totalPnl >= 0 ? "🟢" : "🔴"} Paper PnL: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>\n` +
+      `📂 Positions closed: ${positions.length}`
+    );
+  } catch (e) {
+    console.error(`[RESOLVE ERROR] ${marketId}: ${e.message}`);
+  }
+}
+
 async function checkResolutions() {
   const openMarkets = db.prepare("SELECT DISTINCT market_id FROM paper_positions WHERE resolved = 0").all();
   for (const row of openMarkets) {
@@ -408,7 +445,9 @@ async function main() {
   pollCommands();
   connectWebSocket();
   setInterval(refreshMarkets, 30 * 60 * 1000);
-  setInterval(checkResolutions, 5 * 60 * 1000);
+  // checkResolutions runs via websocket market_resolved event (instant)
+  // Also run once at startup to catch any missed resolutions
+  setTimeout(checkResolutions, 10000);
 
   await sendAlert(
     `🚀 <b>Polymarket Copytrade Bot Started</b>\n` +
