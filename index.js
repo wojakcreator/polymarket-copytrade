@@ -403,18 +403,57 @@ async function checkResolutions() {
   const openMarkets = db.prepare("SELECT DISTINCT market_id FROM paper_positions WHERE resolved = 0").all();
   for (const row of openMarkets) {
     try {
-      const resp = await axios.get(`${GAMMA_BASE}/markets`, {
-        params: { conditionId: row.market_id }, timeout: 8000
-      });
-      const market = resp.data?.[0];
-      if (!market) continue;
-      if (!market.closed) continue;
-
-      const resPrice = resolveOutcomeFromMarket(market);
-      if (resPrice === null) continue; // resolved but outcome unclear, skip for now
-
-      const outcomeLabel = resPrice === 1.0 ? "YES" : "NO";
       const positions = db.prepare("SELECT * FROM paper_positions WHERE market_id = ? AND resolved = 0").all(row.market_id);
+      if (positions.length === 0) continue;
+
+      // Get a whale wallet that traded this market
+      const whaleAddr = positions[0].wallet;
+      const question = positions[0].market_question || row.market_id;
+
+      // Method 1: Check whale's REDEEM activity on this market
+      // If they redeemed, market resolved and their outcome won
+      let resPrice = null;
+      let outcomeLabel = null;
+
+      try {
+        const redeemResp = await axios.get("https://data-api.polymarket.com/activity", {
+          params: { user: whaleAddr, type: "REDEEM", market: row.market_id, limit: 5 },
+          timeout: 8000,
+        });
+        const redeems = redeemResp.data || [];
+        if (redeems.length > 0) {
+          // Whale redeemed — find which outcome they held
+          const posResp = await axios.get("https://data-api.polymarket.com/activity", {
+            params: { user: whaleAddr, type: "TRADE", market: row.market_id, limit: 10 },
+            timeout: 8000,
+          });
+          const trades = posResp.data || [];
+          // Find their last BUY to determine which outcome they held
+          const lastBuy = trades.find(t => t.side === "BUY");
+          if (lastBuy) {
+            const whaleOutcome = (lastBuy.outcome || "").toUpperCase();
+            resPrice = whaleOutcome === "YES" ? 1.0 : 0.0;
+            outcomeLabel = whaleOutcome === "YES" ? "YES" : "NO";
+          }
+        }
+      } catch {}
+
+      // Method 2: Gamma API fallback (works for longer markets)
+      if (resPrice === null) {
+        try {
+          const gammaResp = await axios.get(`${GAMMA_BASE}/markets`, {
+            params: { conditionId: row.market_id }, timeout: 8000
+          });
+          const market = gammaResp.data?.[0];
+          if (market?.closed) {
+            resPrice = resolveOutcomeFromMarket(market);
+            if (resPrice !== null) outcomeLabel = resPrice === 1.0 ? "YES" : "NO";
+          }
+        } catch {}
+      }
+
+      if (resPrice === null) continue;
+
       let totalPnl = 0;
       for (const pos of positions) {
         const pnl = pos.side === "BUY"
@@ -423,10 +462,11 @@ async function checkResolutions() {
         totalPnl += pnl;
         db.prepare("UPDATE paper_positions SET resolved=1, resolved_price=?, pnl=? WHERE id=?").run(resPrice, pnl, pos.id);
       }
-      console.log(`[RESOLVED] ${market.question?.substring(0, 50)} → ${outcomeLabel} | PnL: $${totalPnl.toFixed(2)}`);
+
+      console.log(`[RESOLVED] ${question?.substring(0, 50)} → ${outcomeLabel} | PnL: $${totalPnl.toFixed(2)}`);
       await sendAlert(
         `🏁 <b>MARKET RESOLVED</b>\n━━━━━━━━━━━━━━━━━━━\n` +
-        `📊 ${market.question}\n📌 Outcome: <b>${outcomeLabel}</b>\n` +
+        `📊 ${question}\n📌 Outcome: <b>${outcomeLabel}</b>\n` +
         `${totalPnl >= 0 ? "🟢" : "🔴"} Paper PnL: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>\n` +
         `📂 Positions closed: ${positions.length}`
       );
