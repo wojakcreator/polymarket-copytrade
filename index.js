@@ -221,10 +221,6 @@ async function processActivityTrade(trade, wallet) {
   if (isSeen.get(tradeKey)) return;
   markSeen.run(tradeKey, Date.now());
 
-  // Only process trades from last 60 seconds to avoid processing old history
-  const ageSeconds = Date.now() / 1000 - (trade.timestamp || 0);
-  if (ageSeconds > 60) return;
-
   const price = parseFloat(trade.price || 0);
   const sizeUsd = parseFloat(trade.usdcSize || 0);
   if (sizeUsd < MIN_TRADE_SIZE_USD) return;
