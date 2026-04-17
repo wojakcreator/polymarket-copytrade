@@ -345,6 +345,27 @@ async function refreshMarkets() {
 }
 
 // ─── RESOLUTION CHECKER ──────────────────────────────────────────────────────
+function resolveOutcomeFromMarket(market) {
+  // Method 1: explicit outcome field
+  if (market.outcome) {
+    return market.outcome.toLowerCase() === "yes" ? 1.0 : 0.0;
+  }
+  // Method 2: outcomePrices — resolved market prices go to 1 or 0
+  // e.g. ["1", "0"] = YES won, ["0", "1"] = NO won
+  try {
+    const prices = Array.isArray(market.outcomePrices)
+      ? market.outcomePrices
+      : JSON.parse(market.outcomePrices || "[]");
+    if (prices.length >= 2) {
+      const yesPrice = parseFloat(prices[0]);
+      const noPrice = parseFloat(prices[1]);
+      if (yesPrice === 1 && noPrice === 0) return 1.0;
+      if (yesPrice === 0 && noPrice === 1) return 0.0;
+    }
+  } catch {}
+  return null; // can't determine outcome yet
+}
+
 async function checkResolutions() {
   const openMarkets = db.prepare("SELECT DISTINCT market_id FROM paper_positions WHERE resolved = 0").all();
   for (const row of openMarkets) {
@@ -353,8 +374,13 @@ async function checkResolutions() {
         params: { conditionId: row.market_id }, timeout: 8000
       });
       const market = resp.data?.[0];
-      if (!market?.closed) continue;
-      const resPrice = market.outcome?.toLowerCase() === "yes" ? 1.0 : 0.0;
+      if (!market) continue;
+      if (!market.closed) continue;
+
+      const resPrice = resolveOutcomeFromMarket(market);
+      if (resPrice === null) continue; // resolved but outcome unclear, skip for now
+
+      const outcomeLabel = resPrice === 1.0 ? "YES" : "NO";
       const positions = db.prepare("SELECT * FROM paper_positions WHERE market_id = ? AND resolved = 0").all(row.market_id);
       let totalPnl = 0;
       for (const pos of positions) {
@@ -364,13 +390,16 @@ async function checkResolutions() {
         totalPnl += pnl;
         db.prepare("UPDATE paper_positions SET resolved=1, resolved_price=?, pnl=? WHERE id=?").run(resPrice, pnl, pos.id);
       }
+      console.log(`[RESOLVED] ${market.question?.substring(0, 50)} → ${outcomeLabel} | PnL: $${totalPnl.toFixed(2)}`);
       await sendAlert(
         `🏁 <b>MARKET RESOLVED</b>\n━━━━━━━━━━━━━━━━━━━\n` +
-        `📊 ${market.question}\n📌 Outcome: <b>${market.outcome}</b>\n` +
+        `📊 ${market.question}\n📌 Outcome: <b>${outcomeLabel}</b>\n` +
         `${totalPnl >= 0 ? "🟢" : "🔴"} Paper PnL: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>\n` +
         `📂 Positions closed: ${positions.length}`
       );
-    } catch {}
+    } catch (e) {
+      console.error(`[RESOLVE ERROR] ${row.market_id}: ${e.message}`);
+    }
   }
 }
 
