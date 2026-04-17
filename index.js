@@ -195,56 +195,60 @@ async function bootstrapMarkets() {
 }
 
 // ─── TRADES ──────────────────────────────────────────────────────────────────
-async function getLatestTrades(marketId) {
+// Uses data-api.polymarket.com/activity — fully public, returns wallet-specific
+// trades with all fields we need (side, usdcSize, price, conditionId, outcome)
+async function checkWalletTrades(wallet) {
   try {
-    const resp = await axios.get(`${CLOB_BASE}/trades`, {
-      params: { market: marketId, limit: 10 },
+    const resp = await axios.get(`https://data-api.polymarket.com/activity`, {
+      params: { user: wallet.address, type: "TRADE", limit: 5 },
       timeout: 5000,
     });
-    return resp.data?.data || [];
-  } catch { return []; }
+    const trades = resp.data || [];
+    for (const trade of trades) {
+      await processActivityTrade(trade, wallet);
+    }
+  } catch (e) {
+    console.error(`[DATA] Error fetching ${wallet.nickname}:`, e.message);
+  }
 }
 
-async function processTrade(trade, marketId) {
-  const tradeId = trade.id || trade.trade_id;
+async function processActivityTrade(trade, wallet) {
+  // data-api response fields: transactionHash, conditionId, side, usdcSize, price, asset, outcome, timestamp, title, slug
+  const tradeId = trade.transactionHash;
   if (!tradeId) return;
 
-  const makerAddr = (trade.maker_address || "").toLowerCase();
-  const takerAddr = (trade.taker_address || "").toLowerCase();
-  const whaleAddr = WALLET_SET.has(makerAddr) ? makerAddr
-    : WALLET_SET.has(takerAddr) ? takerAddr : null;
-  if (!whaleAddr) return;
-
-  const tradeKey = `${whaleAddr}:${tradeId}`;
+  const tradeKey = `${wallet.address.toLowerCase()}:${tradeId}`;
   if (isSeen.get(tradeKey)) return;
   markSeen.run(tradeKey, Date.now());
 
+  // Only process trades from last 60 seconds to avoid processing old history
+  const ageSeconds = Date.now() / 1000 - (trade.timestamp || 0);
+  if (ageSeconds > 60) return;
+
   const price = parseFloat(trade.price || 0);
-  const sizeShares = parseFloat(trade.size || 0);
-  const sizeUsd = price * sizeShares;
+  const sizeUsd = parseFloat(trade.usdcSize || 0);
   if (sizeUsd < MIN_TRADE_SIZE_USD) return;
+  if (price <= 0) return;
+
+  const marketId = trade.conditionId;
+  if (!marketId) return;
 
   // Skip markets resolving in less than 24 hours
-  const marketInfo24 = marketCache.get(marketId);
-  if (marketInfo24?.endDate) {
-    const hoursLeft = (new Date(marketInfo24.endDate) - Date.now()) / 3600000;
+  const marketInfo = marketCache.get(marketId);
+  if (marketInfo?.endDate) {
+    const hoursLeft = (new Date(marketInfo.endDate) - Date.now()) / 3600000;
     if (hoursLeft < 24) {
-      console.log(`[SKIP] ${marketId.slice(0, 10)}... resolves in ${hoursLeft.toFixed(1)}h — skipping`);
+      console.log(`[SKIP] ${wallet.nickname} — market resolves in ${hoursLeft.toFixed(1)}h`);
       return;
     }
   }
 
-  const wallet = WALLET_MAP[whaleAddr];
-  const isMaker = makerAddr === whaleAddr;
-  const rawSide = (trade.side || "BUY").toUpperCase();
-  const side = isMaker ? (rawSide === "BUY" ? "SELL" : "BUY") : rawSide;
-
-  const marketInfo = marketCache.get(marketId);
-  const yesTokenId = String(marketInfo?.tokenIds?.[0]);
-  const outcome = String(trade.asset_id) === yesTokenId ? "YES" : "NO";
-  const question = marketInfo?.question || marketId;
-  const marketUrl = marketInfo?.slug
-    ? `https://polymarket.com/event/${marketInfo.slug}`
+  const side = (trade.side || "BUY").toUpperCase();
+  const outcome = (trade.outcome || "Yes").toUpperCase() === "YES" ? "YES" : "NO";
+  const question = trade.title || marketInfo?.question || marketId;
+  const slug = trade.eventSlug || trade.slug || marketInfo?.slug;
+  const marketUrl = slug
+    ? `https://polymarket.com/event/${slug}`
     : "https://polymarket.com";
 
   const shares = COPY_SIZE_FIXED / price;
@@ -311,10 +315,9 @@ function connectWebSocket() {
     const list = Array.isArray(events) ? events : [events];
     for (const event of list) {
       if (event.event_type !== "last_trade_price") continue;
-      const marketId = tokenToMarket.get(String(event.asset_id));
-      if (!marketId) continue;
-      const trades = await getLatestTrades(marketId);
-      for (const trade of trades) await processTrade(trade, marketId);
+      // WS tells us someone traded — immediately check all whale wallets
+      await Promise.all(WALLETS.map(w => checkWalletTrades(w)));
+      break; // one trigger per message batch is enough
     }
   });
 
