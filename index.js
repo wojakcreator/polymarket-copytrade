@@ -95,9 +95,20 @@ async function pollCommands() {
       if (text.startsWith("/stats")) await cmdStats();
       if (text.startsWith("/wallets")) await cmdWallets();
       if (text.startsWith("/status")) await cmdStatus();
+      if (text.startsWith("/resetbalance")) await cmdResetBalance();
     }
   } catch {}
   setTimeout(pollCommands, 1000);
+}
+
+async function cmdResetBalance() {
+  db.prepare("DELETE FROM paper_positions").run();
+  db.prepare("DELETE FROM seen_trades").run();
+  await sendAlert(
+    `🔄 <b>Balance Reset</b>\n━━━━━━━━━━━━━━━━━━━\n` +
+    `💰 Paper balance reset to <b>$${parseFloat(process.env.PAPER_BANKROLL || "1000").toFixed(0)}</b>\n` +
+    `🗑 All positions and trade history cleared`
+  );
 }
 
 async function cmdStats() {
