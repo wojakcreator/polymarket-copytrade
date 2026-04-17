@@ -346,133 +346,71 @@ async function refreshMarkets() {
 }
 
 // ─── RESOLUTION CHECKER ──────────────────────────────────────────────────────
-function resolveOutcomeFromMarket(market) {
-  // Method 1: explicit outcome field
-  if (market.outcome) {
-    return market.outcome.toLowerCase() === "yes" ? 1.0 : 0.0;
+const GAMMA_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  "Accept": "application/json",
+  "Origin": "https://polymarket.com",
+  "Referer": "https://polymarket.com/"
+};
+
+async function getMarketOutcome(marketId) {
+  // Try multiple Gamma endpoints — same pattern as proven resolver
+  const urls = [
+    `${GAMMA_BASE}/markets/${marketId}`,
+    `${GAMMA_BASE}/events/${marketId}`,
+    `${GAMMA_BASE}/markets?conditionId=${marketId}`,
+  ];
+  for (const url of urls) {
+    try {
+      const resp = await axios.get(url, { timeout: 8000, headers: GAMMA_HEADERS });
+      const data = Array.isArray(resp.data) ? resp.data[0] : resp.data;
+      if (!data) continue;
+      const markets = data.markets || [data];
+      for (const market of markets) {
+        if (!market.resolved && !market.closed) continue;
+        const outcomes = JSON.parse(market.outcomes || "[]");
+        const prices = JSON.parse(market.outcomePrices || "[]");
+        for (let i = 0; i < prices.length; i++) {
+          if (parseFloat(prices[i]) >= 0.99) {
+            const winner = outcomes[i].toUpperCase();
+            return { winner, question: market.question };
+          }
+        }
+      }
+    } catch {}
   }
-  // Method 2: outcomePrices — resolved market prices go to 1 or 0
-  // e.g. ["1", "0"] = YES won, ["0", "1"] = NO won
-  try {
-    const prices = Array.isArray(market.outcomePrices)
-      ? market.outcomePrices
-      : JSON.parse(market.outcomePrices || "[]");
-    if (prices.length >= 2) {
-      const yesPrice = parseFloat(prices[0]);
-      const noPrice = parseFloat(prices[1]);
-      if (yesPrice === 1 && noPrice === 0) return 1.0;
-      if (yesPrice === 0 && noPrice === 1) return 0.0;
-    }
-  } catch {}
-  return null; // can't determine outcome yet
+  return null;
 }
 
 async function resolveMarket(marketId) {
   const positions = db.prepare("SELECT * FROM paper_positions WHERE market_id = ? AND resolved = 0").all(marketId);
   if (positions.length === 0) return;
-  try {
-    const resp = await axios.get(`${GAMMA_BASE}/markets`, {
-      params: { conditionId: marketId }, timeout: 8000
-    });
-    const market = resp.data?.[0];
-    if (!market) return;
-    const resPrice = resolveOutcomeFromMarket(market);
-    if (resPrice === null) return;
-    const outcomeLabel = resPrice === 1.0 ? "YES" : "NO";
-    let totalPnl = 0;
-    for (const pos of positions) {
-      const pnl = pos.side === "BUY"
-        ? (resPrice - pos.price) * pos.shares
-        : (pos.price - resPrice) * pos.shares;
-      totalPnl += pnl;
-      db.prepare("UPDATE paper_positions SET resolved=1, resolved_price=?, pnl=? WHERE id=?").run(resPrice, pnl, pos.id);
-    }
-    console.log(`[RESOLVED] ${market.question?.substring(0, 50)} → ${outcomeLabel} | PnL: $${totalPnl.toFixed(2)}`);
-    await sendAlert(
-      `🏁 <b>MARKET RESOLVED</b>\n━━━━━━━━━━━━━━━━━━━\n` +
-      `📊 ${market.question}\n📌 Outcome: <b>${outcomeLabel}</b>\n` +
-      `${totalPnl >= 0 ? "🟢" : "🔴"} Paper PnL: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>\n` +
-      `📂 Positions closed: ${positions.length}`
-    );
-  } catch (e) {
-    console.error(`[RESOLVE ERROR] ${marketId}: ${e.message}`);
+  const result = await getMarketOutcome(marketId);
+  if (!result) return;
+  const resPrice = result.winner === "YES" ? 1.0 : 0.0;
+  let totalPnl = 0;
+  for (const pos of positions) {
+    const pnl = pos.side === "BUY"
+      ? (resPrice - pos.price) * pos.shares
+      : (pos.price - resPrice) * pos.shares;
+    totalPnl += pnl;
+    db.prepare("UPDATE paper_positions SET resolved=1, resolved_price=?, pnl=? WHERE id=?").run(resPrice, pnl, pos.id);
   }
+  const question = result.question || positions[0].market_question || marketId;
+  console.log(`[RESOLVED] ${question.substring(0, 50)} → ${result.winner} | PnL: $${totalPnl.toFixed(2)}`);
+  await sendAlert(
+    `🏁 <b>MARKET RESOLVED</b>\n━━━━━━━━━━━━━━━━━━━\n` +
+    `📊 ${question}\n📌 Outcome: <b>${result.winner}</b>\n` +
+    `${totalPnl >= 0 ? "🟢" : "🔴"} Paper PnL: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>\n` +
+    `📂 Positions closed: ${positions.length}`
+  );
 }
 
 async function checkResolutions() {
   const openMarkets = db.prepare("SELECT DISTINCT market_id FROM paper_positions WHERE resolved = 0").all();
   for (const row of openMarkets) {
-    try {
-      const positions = db.prepare("SELECT * FROM paper_positions WHERE market_id = ? AND resolved = 0").all(row.market_id);
-      if (positions.length === 0) continue;
-
-      // Get a whale wallet that traded this market
-      const whaleAddr = positions[0].wallet;
-      const question = positions[0].market_question || row.market_id;
-
-      // Method 1: Check whale's REDEEM activity on this market
-      // If they redeemed, market resolved and their outcome won
-      let resPrice = null;
-      let outcomeLabel = null;
-
-      try {
-        const redeemResp = await axios.get("https://data-api.polymarket.com/activity", {
-          params: { user: whaleAddr, type: "REDEEM", market: row.market_id, limit: 5 },
-          timeout: 8000,
-        });
-        const redeems = redeemResp.data || [];
-        if (redeems.length > 0) {
-          // Whale redeemed — find which outcome they held
-          const posResp = await axios.get("https://data-api.polymarket.com/activity", {
-            params: { user: whaleAddr, type: "TRADE", market: row.market_id, limit: 10 },
-            timeout: 8000,
-          });
-          const trades = posResp.data || [];
-          // Find their last BUY to determine which outcome they held
-          const lastBuy = trades.find(t => t.side === "BUY");
-          if (lastBuy) {
-            const whaleOutcome = (lastBuy.outcome || "").toUpperCase();
-            resPrice = whaleOutcome === "YES" ? 1.0 : 0.0;
-            outcomeLabel = whaleOutcome === "YES" ? "YES" : "NO";
-          }
-        }
-      } catch {}
-
-      // Method 2: Gamma API fallback (works for longer markets)
-      if (resPrice === null) {
-        try {
-          const gammaResp = await axios.get(`${GAMMA_BASE}/markets`, {
-            params: { conditionId: row.market_id }, timeout: 8000
-          });
-          const market = gammaResp.data?.[0];
-          if (market?.closed) {
-            resPrice = resolveOutcomeFromMarket(market);
-            if (resPrice !== null) outcomeLabel = resPrice === 1.0 ? "YES" : "NO";
-          }
-        } catch {}
-      }
-
-      if (resPrice === null) continue;
-
-      let totalPnl = 0;
-      for (const pos of positions) {
-        const pnl = pos.side === "BUY"
-          ? (resPrice - pos.price) * pos.shares
-          : (pos.price - resPrice) * pos.shares;
-        totalPnl += pnl;
-        db.prepare("UPDATE paper_positions SET resolved=1, resolved_price=?, pnl=? WHERE id=?").run(resPrice, pnl, pos.id);
-      }
-
-      console.log(`[RESOLVED] ${question?.substring(0, 50)} → ${outcomeLabel} | PnL: $${totalPnl.toFixed(2)}`);
-      await sendAlert(
-        `🏁 <b>MARKET RESOLVED</b>\n━━━━━━━━━━━━━━━━━━━\n` +
-        `📊 ${question}\n📌 Outcome: <b>${outcomeLabel}</b>\n` +
-        `${totalPnl >= 0 ? "🟢" : "🔴"} Paper PnL: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>\n` +
-        `📂 Positions closed: ${positions.length}`
-      );
-    } catch (e) {
-      console.error(`[RESOLVE ERROR] ${row.market_id}: ${e.message}`);
-    }
+    await resolveMarket(row.market_id);
+    await new Promise(r => setTimeout(r, 300));
   }
 }
 
